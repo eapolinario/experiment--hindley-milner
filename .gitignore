@@ -1,0 +1,9 @@
+dist-newstyle/
+.direnv/
+.cabal-remote/
+cabal.project.local
+cabal.project.local~
+.ghc.environment.*
+*.o
+*.hi
+*.hie
