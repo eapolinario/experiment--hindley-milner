@@ -1,0 +1,49 @@
+cabal-version: 3.0
+name:          hindley-milner
+version:       0.1.0.0
+synopsis:      Hindley-Milner (Algorithm W) type inference engine
+description:
+  A clear, well-tested implementation of Hindley-Milner type inference
+  for a small ML-like lambda calculus. Feed it an AST, get back types.
+  .
+  Design: immutable type variables with explicit substitutions (not mutable
+  refs) — makes the algorithm structure maximally visible.
+license:       MIT
+author:        Eduardo
+build-type:    Simple
+
+common warnings
+  ghc-options: -Wall -Wno-name-shadowing
+
+-- -----------------------------------------------------------------------
+-- Library: the inference engine itself
+-- -----------------------------------------------------------------------
+library
+  import:             warnings
+  hs-source-dirs:     src
+  exposed-modules:
+    Types
+    Subst
+    Env
+    Pretty
+    Unify
+    Infer
+  build-depends:
+    base       >= 4.14 && < 5,
+    containers >= 0.6,
+    mtl        >= 2.2
+  default-language:   Haskell2010
+  default-extensions: LambdaCase
+
+-- -----------------------------------------------------------------------
+-- Test suite
+-- -----------------------------------------------------------------------
+test-suite test-infer
+  import:           warnings
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          TestInfer.hs
+  build-depends:
+    base,
+    hindley-milner
+  default-language: Haskell2010
