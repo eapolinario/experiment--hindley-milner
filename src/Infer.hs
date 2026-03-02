@@ -236,8 +236,9 @@ inferExpr e = runInfer $ do
 
 -- | Apply a substitution to every type annotation inside a 'TypedExpr'.
 --
--- Called at the end of 'inferExprTyped' to resolve all remaining type
--- variables to their concrete types, producing a fully-annotated AST.
+-- Called at the end of 'inferExprTyped' to apply the final substitution to
+-- all type annotations in the resulting 'TypedExpr'.  Note that for
+-- polymorphic expressions, unconstrained type variables may still remain.
 applyTyped :: Subst -> TypedExpr -> TypedExpr
 applyTyped s (TELit  l t)        = TELit  l (Subst.applyTy s t)
 applyTyped s (TEVar  x t)        = TEVar  x (Subst.applyTy s t)
