@@ -78,11 +78,11 @@ ppExpr (App f arg) = ppFun f ++ " " ++ ppArg arg
 -- Typed expressions
 -- ---------------------------------------------------------------------------
 
-{- | Pretty-print a typed expression, showing type annotations at every node.
+{- | Pretty-print a typed expression, showing type annotations at every non-literal node.
 
 Format:
 
-  * Literals:     @42@  (type is obvious from value; not repeated)
+  * Literals:     @42@  (type is obvious from value; annotation omitted)
   * Variables:    @x : T@
   * Lambdas:      @λ(x : T₁). body@   (whole type = @T₁ -> typeOf body@)
   * Application:  @(f) arg : T@
