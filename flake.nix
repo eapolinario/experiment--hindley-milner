@@ -18,6 +18,7 @@
         ghcWithDeps = hpkgs.ghcWithPackages (ps: with ps; [
           containers  # Data.Map, Data.Set
           mtl         # Control.Monad.State, Control.Monad.Except
+          hspec       # test suite
         ]);
       in {
         # --- Development shell ---
