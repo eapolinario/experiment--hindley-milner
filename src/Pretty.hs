@@ -8,6 +8,7 @@ module Pretty (
     ppTy,
     ppScheme,
     ppExpr,
+    ppTypedExpr,
     canonicalize,
 ) where
 
@@ -72,6 +73,65 @@ ppExpr (App f arg) = ppFun f ++ " " ++ ppArg arg
     ppArg e@(App _ _) = "(" ++ ppExpr e ++ ")"
     ppArg e@(Lam _ _) = "(" ++ ppExpr e ++ ")"
     ppArg e = ppExpr e
+
+-- ---------------------------------------------------------------------------
+-- Typed expressions
+-- ---------------------------------------------------------------------------
+
+{- | Pretty-print a typed expression, showing type annotations at every node.
+
+Format:
+
+  * Literals:     @42@  (type is obvious from value; not repeated)
+  * Variables:    @x : T@
+  * Lambdas:      @λ(x : T₁). body@   (whole type = @T₁ -> typeOf body@)
+  * Application:  @(f) arg : T@
+  * Let:          @let x : σ = e1 in e2@
+
+The function in an application is always wrapped in @(…)@ to prevent the
+function's @: T@ annotation from being read as part of the argument list.
+
+Example — @let id = λx. x in id 1@:
+
+@
+  let id : ∀'a. 'a -> 'a = λ(x : 'a). x : 'a in (id : Int -> Int) 1 : Int
+@
+
+The lambda's body shows @x : 'a@ (still polymorphic at the definition site).
+The application site shows @id : Int -> Int@ (instantiated for this call).
+This makes instantiation and generalization visually obvious.
+-}
+ppTypedExpr :: TypedExpr -> String
+ppTypedExpr = goTop
+  where
+    -- Literals: no annotation — type is self-evident.
+    goTop (TELit l _) =
+        ppLit l
+    -- Variables: always show the instantiated type.
+    goTop (TEVar x t) =
+        x ++ " : " ++ ppTy t
+    -- Lambdas: show parameter type; body is printed recursively.
+    goTop (TELam x pt body) =
+        "λ(" ++ x ++ " : " ++ ppTy pt ++ "). " ++ goTop body
+    -- Applications: wrap the function in parens to avoid annotation ambiguity,
+    -- then show the result type at the end.
+    goTop (TEApp f a resTy) =
+        goFun f ++ " " ++ goArg a ++ " : " ++ ppTy resTy
+    -- Let: show the generalized scheme of the bound variable.
+    goTop (TELet x sc e1 e2) =
+        "let " ++ x ++ " : " ++ ppScheme sc
+        ++ " = " ++ goTop e1
+        ++ " in " ++ goTop e2
+
+    -- Function position: always wrap in parens.
+    -- This prevents "x : Int -> Int arg : T" being misread as a type.
+    goFun e = "(" ++ goTop e ++ ")"
+
+    -- Argument position: wrap only compound forms that need disambiguation.
+    goArg e@(TEApp _ _ _)   = "(" ++ goTop e ++ ")"
+    goArg e@(TELam _ _ _)   = "(" ++ goTop e ++ ")"
+    goArg e@(TELet _ _ _ _) = "(" ++ goTop e ++ ")"
+    goArg e                 = goTop e
 
 -- ---------------------------------------------------------------------------
 -- Canonicalization

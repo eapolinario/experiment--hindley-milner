@@ -9,8 +9,8 @@ module Main where
 
 import Test.Hspec (Expectation, describe, expectationFailure, hspec, it, shouldBe)
 
-import Infer (inferExpr, ppError)
-import Pretty (ppScheme)
+import Infer (inferExpr, inferExprTyped, ppError)
+import Pretty (ppScheme, ppTypedExpr)
 import Types
 
 -- ---------------------------------------------------------------------------
@@ -282,3 +282,72 @@ main = hspec $ do
                     )
                 )
                 "error"
+
+    describe "Typed AST output (inferExprTyped)" $ do
+        -- The typed AST is the \"typed-AST-out\" of the project description.
+        -- Every sub-expression is annotated with its inferred type.
+
+        it "literal: TELit carries its type" $
+            inferExprTyped (int 42)
+                `shouldBe` Right (TELit (LInt 42) (TCon "Int"))
+
+        it "bool literal: TELit carries its type" $
+            inferExprTyped (bool True)
+                `shouldBe` Right (TELit (LBool True) (TCon "Bool"))
+
+        it "identity lambda: parameter type recorded in TELam" $ do
+            -- λx. x  ⟹  TELam "x" (TVar "a") (TEVar "x" (TVar "a"))
+            -- typeOf result = TFun (TVar "a") (TVar "a")
+            let result = inferExprTyped (lam "x" (v "x"))
+            case result of
+                Left err -> expectationFailure (ppError err)
+                Right te -> do
+                    -- The top-level type is 'a -> 'a
+                    ppTypedExpr te `shouldBe` "λ(x : 'a). x : 'a"
+                    typeOf te `shouldBe` TFun (TVar "a") (TVar "a")
+
+        it "identity applied to int: TEApp result type is Int" $ do
+            -- (λx. x) 1  ⟹  TEApp ... (TCon "Int")
+            let result = inferExprTyped (app (lam "x" (v "x")) (int 1))
+            case result of
+                Left err -> expectationFailure (ppError err)
+                Right te -> do
+                    typeOf te `shouldBe` TCon "Int"
+                    ppTypedExpr te
+                        `shouldBe` "(λ(x : Int). x : Int) 1 : Int"
+
+        it "let id = λx.x in id 1: shows polymorphic scheme and instantiated type" $ do
+            -- The TELet node carries the generalized scheme ∀'a. 'a -> 'a.
+            -- The TEVar "id" inside the body is instantiated to Int -> Int.
+            let expr   = lett "id" (lam "x" (v "x")) (app (v "id") (int 1))
+                result = inferExprTyped expr
+            case result of
+                Left err -> expectationFailure (ppError err)
+                Right te -> do
+                    typeOf te `shouldBe` TCon "Int"
+                    ppTypedExpr te
+                        `shouldBe` "let id : ∀'a. 'a -> 'a = λ(x : 'a). x : 'a in (id : Int -> Int) 1 : Int"
+
+        it "let chain: polymorphism flows through second binding" $ do
+            -- let f = λx.x in let g = f in g
+            -- Both f and g are polymorphic; the final g has type 'c -> 'c
+            -- (each instantiation generates a fresh variable, so the variable
+            -- name depends on the internal counter — check structure, not name).
+            let expr = lett "f" (lam "x" (v "x")) (lett "g" (v "f") (v "g"))
+            case inferExprTyped expr of
+                Left err -> expectationFailure (ppError err)
+                Right te -> case typeOf te of
+                    TFun t1 t2 -> t1 `shouldBe` t2   -- polymorphic: same var in and out
+                    other      -> expectationFailure $ "expected function type, got: " ++ show other
+
+        it "const: both type vars appear in TELam chain" $ do
+            -- λx. λy. x  ⟹  type is 'a -> 'b -> 'a
+            case inferExprTyped (lam "x" (lam "y" (v "x"))) of
+                Left err -> expectationFailure (ppError err)
+                Right te -> typeOf te `shouldBe` TFun (TVar "a") (TFun (TVar "b") (TVar "a"))
+
+        it "error case: inferExprTyped propagates type errors" $
+            -- λf. f f  fails occurs check
+            case inferExprTyped (lam "f" (app (v "f") (v "f"))) of
+                Left _  -> pure ()  -- correct: error propagated
+                Right te -> expectationFailure $ "expected error, got: " ++ ppTypedExpr te
