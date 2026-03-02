@@ -7,3 +7,9 @@ cabal.project.local~
 *.o
 *.hi
 *.hie
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
