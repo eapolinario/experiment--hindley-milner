@@ -1,0 +1,1041 @@
+#+TITLE: A Socratic Guide to Hindley-Milner Type Inference
+#+OPTIONS: toc:2 num:nil
+#+STARTUP: overview
+
+* Chapter 1: Why types?
+
+Before we touch any code, think about what types are actually /for/.
+
+** What can go wrong without types?
+
+Consider a language with no type system at all.  You can write:
+
+#+begin_example
+add 1 true
+#+end_example
+
+What happens at runtime?  List three distinct failure modes.
+
+:ANSWER:
+
+1. *Silent wrong answer*: the machine adds 1 to the bit pattern of =true= (often 1),
+   yielding 2.  No error, wrong result.
+2. *Crash*: the runtime tries to call =true= as a function, segfaults, or raises
+   an unhandled exception at the call site.
+3. *Type confusion propagates*: the bad value flows into another operation and
+   the error surfaces far from the source, with a misleading message.
+
+None of these failures give a good error message, and none happen at compile time.
+
+:END:
+
+** What does a type system promise?
+
+A type system is a /static/ approximation of runtime behaviour.  What exactly
+does it promise?  And what does it *not* promise?
+
+:ANSWER:
+
+A sound type system promises *progress and preservation*:
+
+- *Progress*: a well-typed program is never "stuck" — it either has a value
+  or can take a reduction step.
+- *Preservation*: each step preserves the type — if =e : T= and =e → e'=, then =e' : T=.
+
+What it does *not* promise:
+
+- *Correctness.*  =reverse : [a] → [a]= types fine; it could still return the wrong list.
+- *Termination.*  Types say nothing about whether a program halts.
+- *All runtime errors.*  Division by zero and array out-of-bounds still escape.
+
+The punchline: types rule out a specific, important class of bugs cheaply and mechanically.
+
+:END:
+
+** What is the type of the number 42?
+
+Before reading the next chapter, write down your intuition.  What "is" =42=?
+
+:ANSWER:
+
+In our system, =42= has type =Int= — a concrete type constant, written =TCon "Int"=.
+It is not polymorphic: =42= is not a =Bool=, not a function.
+
+This seems obvious.  The interesting question is: what is the type of =λx. x=?
+That question cannot be answered without type *variables*.
+
+:END:
+
+* Chapter 2: The object of study — expressions
+
+The engine takes an *expression* as input and produces a *type* as output.
+Before we can talk about inference, we need to know what we are inferring about.
+
+** What are the five kinds of expression?
+
+Look at the =Expr= type.  List the five constructors and give an informal English
+description of each.
+
+:ANSWER:
+
+From [[file:src/Types.hs::64][Types.hs:64]]:
+
+| Constructor             | Meaning                                      |
+|-------------------------+----------------------------------------------|
+| =Var String=            | A variable reference, e.g. =x=               |
+| =App Expr Expr=         | Function application: =f= applied to =x=     |
+| =Lam String Expr=       | Lambda abstraction: =λx. body=               |
+| =Let String Expr Expr=  | Let-binding: =let x = e₁ in e₂=             |
+| =Lit Lit=               | A literal integer or boolean                 |
+
+There is deliberately no parser.  You build ASTs by hand in tests and the REPL.
+
+:END:
+
+** How do you represent =λx. x= as a Haskell value?
+
+Write it out using the constructors above.
+
+:ANSWER:
+
+#+begin_src haskell
+Lam "x" (Var "x")
+#+end_src
+
+The string ="x"= appears twice: once as the *bound name* in =Lam=, once as the
+*variable reference* in =Var=.  The connection between them is by name alone —
+there are no de Bruijn indices or other binding structure.
+
+:END:
+
+** How do you represent =let id = λx. x in id 1=?
+
+Write it as a Haskell value using the constructors.  Then, in plain English,
+trace what this program *does* at runtime.
+
+:ANSWER:
+
+#+begin_src haskell
+Let "id" (Lam "x" (Var "x")) (App (Var "id") (Lit (LInt 1)))
+#+end_src
+
+At runtime:
+
+1. Evaluate =λx. x= — the identity function.
+2. Bind it to the name =id=.
+3. Apply =id= to =1=.
+4. =id 1= reduces to =1=.
+
+The interesting question is not what it *does* at runtime, but what type the
+inference engine assigns to =id=, and why.
+
+:END:
+
+** What is the type of =const = λx. λy. x=?
+
+Write the expression as a Haskell value.  Then guess the type.
+
+:ANSWER:
+
+#+begin_src haskell
+Lam "x" (Lam "y" (Var "x"))
+#+end_src
+
+The type is =∀a b. a → b → a=.  In our representation:
+=TFun (TVar "a") (TFun (TVar "b") (TVar "a"))=, generalised over =["a","b"]=.
+
+We need *two* type variables because =x= and =y= may have completely different
+types.  The return type is the same as =x='s type because we return =x=.
+
+:END:
+
+* Chapter 3: What is a type?
+
+Now we turn to the *output* of inference.  A type is not just ="Int"= or ="Bool"= —
+it can contain unknowns.
+
+** What are the three forms a type can take?
+
+Look at the =Ty= data type.  Name each constructor and describe it.
+
+:ANSWER:
+
+From [[file:src/Types.hs::16][Types.hs:16]]:
+
+| Constructor    | Meaning                                       |
+|----------------+-----------------------------------------------|
+| =TVar TVar=    | A type variable — an unknown to be solved     |
+| =TCon String=  | A type constant: ="Int"=, ="Bool"=, …        |
+| =TFun Ty Ty=   | A function type: argument type → return type |
+
+=TVar= is the key innovation: it lets us write types with "holes" that
+unification will fill in.
+
+:END:
+
+** What is the type of =true=?
+
+Just =true= — a boolean literal.  No tricks.
+
+:ANSWER:
+
+=TCon "Bool"=.
+
+It is a monomorphic concrete type.  There is nothing to solve.
+
+:END:
+
+** Why can't we write the type of =λx. x= without a type variable?
+
+Suppose someone insisted on giving =λx. x= a type using only =TCon= and =TFun=,
+no =TVar= at all.  What would that type have to be?
+
+:ANSWER:
+
+There is no single concrete type that works.  If we declare =λx. x : Int → Int=,
+then =(λx. x) true= would be a type error — but it should be fine.
+If we declare =Bool → Bool=, then =(λx. x) 1= breaks.
+
+The identity function works for *any* type of input.  To express this we must
+write =a → a= for some type variable =a=.  Concretely:
+=TFun (TVar "a") (TVar "a")=.
+
+Type variables are the only way to say "this works for any type."
+
+:END:
+
+** What does =TFun (TVar "a") (TFun (TVar "b") (TVar "a"))= mean in plain English?
+
+Translate this Haskell value into words a non-programmer could understand.
+
+:ANSWER:
+
+"A function that takes a value of some type (call it =a=), then takes a value
+of some other type (call it =b=), and returns a value of the same type as the
+first argument."
+
+This is =const=: whatever you give first, you get back, regardless of the second
+argument.
+
+:END:
+
+* Chapter 4: Type variables — the unknown
+
+Type variables are the engine of polymorphism.  Before we can solve them, we
+need to understand what they represent.
+
+** What is the difference between =TVar "a"= and =TCon "Int"=?
+
+Both are values of type =Ty=.  What does each one *mean*?
+
+:ANSWER:
+
+=TCon "Int"= is *known*: it refers to the concrete integer type.  It has a fixed
+identity and is equal only to itself.
+
+=TVar "a"= is *unknown*: it is a placeholder for some type yet to be determined.
+It can be unified with any type — another =TVar=, a =TCon=, or a =TFun=.
+Think of it as a variable in an algebra equation: =x = 5= tells you what =x= is,
+but until you solve the equation, =x= is just a name for something unknown.
+
+:END:
+
+** Why do we generate *fresh* type variables rather than reusing the same one?
+
+Suppose every time we needed a type variable, we always used =TVar "a"=.
+What would go wrong when inferring =λx. λy. x=?
+
+:ANSWER:
+
+If we used =TVar "a"= for both =x= and =y=, we would add =x : 'a= and =y : 'a= to the
+environment.  Unification would then conclude that =x= and =y= must have the
+*same* type.  But =const= should work for *different* types.
+
+Fresh variables guarantee that each "unknown" is a separate entity.
+Two fresh variables =t₁= and =t₂= can be unified with different things independently.
+
+The =fresh= function ([[file:src/Infer.hs::68][Infer.hs:68]]) generates ="a"=, ="b"=, …, ="z"=, ="a1"=, …,
+using a counter threaded through the =Infer= monad.
+
+:END:
+
+** When does a type variable "get resolved"?
+
+Think about the lifecycle of a type variable from creation to final type.
+
+:ANSWER:
+
+1. *Creation*: =fresh= generates a new name, say ="t3"=.  It enters the environment
+   or a type being constructed.
+2. *Constraint*: during inference, unification discovers that ="t3"= must equal
+   some type =τ=.  This produces the substitution ={t3 ↦ τ}=.
+3. *Resolution*: the substitution is applied to all types mentioning ="t3"=,
+   replacing the variable with =τ=.
+4. *Remaining free*: if no constraint ever pins down ="t3"=, it stays free in
+   the final type.  Free variables in the final result get *generalised* into
+   universally quantified variables (=∀=).
+
+:END:
+
+* Chapter 5: Substitution — making things concrete
+
+A substitution is a map from type variable names to types.  The operations on
+it require careful thought.
+
+** What does =applyTy= do, step by step?
+
+Read the definition and trace it on =TFun (TVar "a") (TCon "Int")= with
+substitution ={a ↦ Bool}=.
+
+:ANSWER:
+
+From [[file:src/Subst.hs::53][Subst.hs:53]]:
+
+#+begin_src haskell
+applyTy s = \case
+  TVar v     -> Map.findWithDefault (TVar v) v s
+  TCon c     -> TCon c
+  TFun t1 t2 -> TFun (applyTy s t1) (applyTy s t2)
+#+end_src
+
+Trace with =s = {a ↦ Bool}=, =t = TFun (TVar "a") (TCon "Int")=:
+
+1. =t= is =TFun=, so recurse on both sides.
+2. Left: =applyTy s (TVar "a")= — look up ="a"= in =s= — found =TCon "Bool"= — return =TCon "Bool"=.
+3. Right: =applyTy s (TCon "Int")= — =TCon= case — return unchanged =TCon "Int"=.
+4. Result: =TFun (TCon "Bool") (TCon "Int")=, i.e. =Bool → Int=.
+
+:END:
+
+** What does =applyScheme= do differently from =applyTy=?  Why?
+
+Read =applyScheme= and explain the =foldr Map.delete s vars= line.
+
+:ANSWER:
+
+From [[file:src/Subst.hs::63][Subst.hs:63]]:
+
+#+begin_src haskell
+applyScheme s (Scheme vars t) =
+  let s' = foldr Map.delete s vars
+  in  Scheme vars (applyTy s' t)
+#+end_src
+
+The =vars= are *bound* by the ∀.  If the substitution happened to map ="a"= to
+something, but ="a"= is a bound variable in the scheme, we must *not* substitute
+it — doing so would break the binding structure.
+
+=foldr Map.delete s vars= removes every bound variable from =s=, producing =s'=.
+Only then do we apply =s'= to the body =t=.
+
+Example: =Scheme ["a"] (TFun (TVar "a") (TVar "b"))= with =s = {a ↦ Int, b ↦ Bool}=.
+After deletion: =s' = {b ↦ Bool}=.
+Result: =Scheme ["a"] (TFun (TVar "a") (TCon "Bool"))=.
+The bound ="a"= is untouched; the free ="b"= is substituted.
+
+:END:
+
+** What does =compose s1 s2= mean?  State the equivalence it must satisfy.
+
+Before looking at the implementation, write down the mathematical property that
+=compose= must satisfy.
+
+:ANSWER:
+
+The composition law:
+
+#+begin_example
+applyTy (compose s1 s2) t  ≡  applyTy s1 (applyTy s2 t)
+#+end_example
+
+=compose s1 s2= is the substitution that, applied once, has the same effect as
+first applying =s2= then applying =s1=.  It is function composition =s1 ∘ s2=, with
+=s2= applied first.
+
+From [[file:src/Subst.hs::103][Subst.hs:103]]:
+
+#+begin_src haskell
+compose s1 s2 = Map.map (applyTy s1) s2 `Map.union` s1
+#+end_src
+
+Each entry in =s2= gets "threaded through" =s1= (applying =s1= to every right-hand
+side of =s2=).  Then we take the union, with =s2='s updated entries winning on
+overlap (=Map.union= is left-biased).
+
+:END:
+
+** Trace by hand: compose ={a ↦ Int}= and ={b ↦ TFun (TVar "a") Bool}=
+
+Call them =s1 = {a ↦ Int}= and =s2 = {b ↦ TFun (TVar "a") (TCon "Bool")}=.
+Compute =compose s1 s2= step by step.  Then verify the law holds for
+=t = TFun (TVar "a") (TVar "b")=.
+
+:ANSWER:
+
+*Step 1*: Apply =s1= to every value in =s2=:
+
+- =applyTy {a ↦ Int} (TFun (TVar "a") (TCon "Bool"))=
+- Left of TFun: =TVar "a"= → =TCon "Int"=
+- Right of TFun: =TCon "Bool"= → unchanged
+- Updated =s2= entry: ={b ↦ TFun (TCon "Int") (TCon "Bool")}=, i.e. ={b ↦ Int → Bool}=
+
+*Step 2*: Union with =s1=:
+
+=compose s1 s2 = {b ↦ Int → Bool, a ↦ Int}=
+
+*Verification* on =t = TFun (TVar "a") (TVar "b")=:
+
+Right-hand side — apply =s2= first, then =s1=:
+
+- =applyTy s2 t= = =TFun (TVar "a") (TFun (TCon "Int") (TCon "Bool"))=
+  (="a"= not in =s2=, unchanged; ="b"= → =TFun Int Bool=)
+- =applyTy s1 (TFun (TVar "a") (TFun (TCon "Int") (TCon "Bool")))=
+  (="a"= → =TCon "Int"=)
+- = =TFun (TCon "Int") (TFun (TCon "Int") (TCon "Bool"))=
+
+Left-hand side — apply composed substitution at once:
+
+- =TVar "a"= → =TCon "Int"=
+- =TVar "b"= → =TFun (TCon "Int") (TCon "Bool")=
+- = =TFun (TCon "Int") (TFun (TCon "Int") (TCon "Bool"))= ✓
+
+:END:
+
+** What goes wrong if you compose in the wrong order?
+
+Compute =compose s2 s1= (reversed) and apply it to the same =t=.
+
+:ANSWER:
+
+=compose s2 s1= applies =s2= to the values in =s1=:
+
+- =applyTy s2 (TCon "Int")= = =TCon "Int"= (no type variables, unchanged)
+- Updated =s1=: ={a ↦ Int}= (unchanged)
+- Union with =s2=: ={a ↦ Int, b ↦ TFun (TVar "a") (TCon "Bool")}=
+
+Apply to =t = TFun (TVar "a") (TVar "b")=:
+
+- =TVar "a"= → =TCon "Int"=
+- =TVar "b"= → =TFun (TVar "a") (TCon "Bool")= — *still has =TVar "a"= inside!*
+- Result: =TFun (TCon "Int") (TFun (TVar "a") (TCon "Bool"))=
+
+A free type variable survived even though we had a substitution for ="a"=.
+This is the composition-order bug: when composing =s1 ∘ s2=, =s2='s values must
+be threaded through =s1=, not the other way around.
+
+:END:
+
+* Chapter 6: Unification — solving type equations
+
+Unification takes two types and finds the most general substitution that makes
+them equal.  It is the constraint-solving engine at the heart of Algorithm W.
+
+** What substitution unifies =TFun (TVar "a") (TVar "b")= with =TFun (TCon "Int") (TCon "Bool")=?
+
+Work it out by hand before looking at the code.
+
+:ANSWER:
+
+We need =s= such that =applyTy s (a → b) = applyTy s (Int → Bool)=.
+
+Both sides are =TFun=, so we match component-wise:
+
+1. Unify left arguments: =TVar "a"= with =TCon "Int"= → ={a ↦ Int}=.
+2. Apply ={a ↦ Int}= to both right arguments: =TVar "b"= and =TCon "Bool"= (unchanged).
+3. Unify right arguments: =TVar "b"= with =TCon "Bool"= → ={b ↦ Bool}=.
+4. Compose: ={a ↦ Int, b ↦ Bool}=.
+
+From [[file:src/Unify.hs::69][Unify.hs:69]]:
+
+#+begin_src haskell
+unify (TFun arg1 ret1) (TFun arg2 ret2) = do
+  s1 <- unify arg1 arg2
+  s2 <- unify (Subst.applyTy s1 ret1) (Subst.applyTy s1 ret2)
+  return (Subst.compose s2 s1)
+#+end_src
+
+:END:
+
+** Why does =unify (TVar "a") (TFun (TVar "a") (TVar "b"))= fail?
+
+What would it mean to "succeed"?
+
+:ANSWER:
+
+If we bound =a ↦ TFun (TVar "a") (TVar "b")=, then applying the substitution would give:
+
+=TVar "a"= → =TFun (TVar "a") (TVar "b")= → =TFun (TFun (TVar "a") (TVar "b")) (TVar "b")= → …
+
+Unrolling never terminates.  The "type" would be infinite:
+=a = a → b = (a → b) → b = ((a → b) → b) → b = …=
+
+The *occurs check* prevents this.  Before binding =v ↦ t=, we verify that =v= does
+not appear free in =t=.  If it does, we reject.
+
+From [[file:src/Unify.hs::85][Unify.hs:85]]:
+
+#+begin_src haskell
+bind v t | Set.member v (Subst.ftvTy t) = Left (OccursCheckFailed v t)
+#+end_src
+
+:END:
+
+** Trace by hand: =unify (TFun (TVar "a") (TVar "b")) (TFun (TVar "c") (TVar "c"))=
+
+Work through each case of =unify= step by step.
+
+:ANSWER:
+
+Both sides are =TFun=, so:
+
+*Step 1*: Unify left arguments — =TVar "a"= and =TVar "c"=.
+
+- ="a"= is a type var.  Occurs check: ="a"= ∉ ftv(=TVar "c"=) = {"c"}.  OK.
+- =s1 = {a ↦ TVar "c"}=.
+
+*Step 2*: Apply =s1= to both return types, then unify.
+
+- =applyTy s1 (TVar "b")= = =TVar "b"= (="b"= not in =s1=)
+- =applyTy s1 (TVar "c")= = =TVar "c"= (="c"= not in =s1=)
+- Unify =TVar "b"= with =TVar "c"=:
+  - Occurs check: ="b"= ∉ {"c"}.  OK.
+  - =s2 = {b ↦ TVar "c"}=.
+
+*Step 3*: Compose =s2 ∘ s1=.
+
+- Apply =s2= to values in =s1=: =applyTy {b ↦ c} (TVar "c")= = =TVar "c"= (unchanged).
+- Union: ={a ↦ TVar "c", b ↦ TVar "c"}=.
+
+Final result: ={a ↦ c, b ↦ c}=.
+
+Check: =applyTy result (a → b)= = =TFun (TVar "c") (TVar "c")=.
+=applyTy result (c → c)= = =TFun (TVar "c") (TVar "c")=. ✓
+
+:END:
+
+** Why must we apply =s1= to the return types before unifying them?
+
+In the =TFun= case, why is the second =unify= call on =Subst.applyTy s1 ret1= and
+=Subst.applyTy s1 ret2= rather than just =ret1= and =ret2=?
+
+:ANSWER:
+
+Consider =unify (a → a) (Int → b)=.
+
+*Step 1*: Unify left arguments — =a= and =Int= — giving =s1 = {a ↦ Int}=.
+
+If we then called =unify ret1 ret2= = =unify (TVar "a") (TVar "b")= without applying
+=s1=, we would get =s2 = {a ↦ b}= (or ={b ↦ a}=).  Composing =s2 ∘ s1= would produce
+conflicting information about ="a"=.
+
+The correct approach: apply =s1= first, turning the return types into
+=applyTy s1 (TVar "a")= = =TCon "Int"= and =applyTy s1 (TVar "b")= = =TVar "b"=.
+Now we unify =Int= with =b=, getting =s2 = {b ↦ Int}=.
+Final: ={a ↦ Int, b ↦ Int}=. ✓
+
+The principle: each intermediate substitution must be propagated forward before
+the next unification, or constraints get lost.
+
+:END:
+
+* Chapter 7: The environment — what's in scope
+
+The environment =Env= maps variable names to type schemes.  It is the typing
+context — the accumulated knowledge about what types things have.
+
+** What does the environment contain at each point in inferring =λx. x 1=?
+
+Trace the inference step by step, describing the environment at each sub-expression.
+
+:ANSWER:
+
+Expression: =Lam "x" (App (Var "x") (Lit (LInt 1)))=
+
+1. *Start*: env = ={  }=.
+2. *Enter =Lam "x"=*: generate fresh var ="a"=.  New env = ={x : Scheme [] (TVar "a")}=.
+3. *Infer body =App (Var "x") (Lit 1)=* in env = ={x : Scheme [] a}=.
+4. *Infer =Var "x"=*: look up =x= → =Scheme [] (TVar "a")=.  Instantiate (no vars to replace) → =TVar "a"=.
+5. *Infer =Lit 1=*: returns =(empty, TCon "Int")=.
+6. *Unify =funcTy= with =Int → β=*: =TVar "a"= ~ =TFun (TCon "Int") (TVar "b")= → ={a ↦ Int → b}=.
+
+The environment grows as we go inward: each lambda adds one entry; each let
+adds one entry (with a scheme rather than a bare type).
+
+:END:
+
+** Why must we call =Env.apply s1 env= before inferring a sub-expression?
+
+The =App= case passes =Env.apply s1 env= when inferring the argument.
+What would break if we passed the original =env= instead?
+
+:ANSWER:
+
+From [[file:src/Infer.hs::190][Infer.hs:190]]:
+
+#+begin_src haskell
+(s2, argTy) <- infer (Env.apply s1 env) arg
+#+end_src
+
+=s1= contains constraints discovered while inferring the function expression.
+Those constraints may affect type variables that appear in the environment.
+
+Example: suppose env has ={f : Scheme [] (TVar "a")}=, and inferring the function
+returned =s1 = {a ↦ Int → Bool}=.  If we don't apply =s1= to env, the argument
+inference sees =f : 'a= — unknown.  If we do apply it, the argument sees
+=f : Int → Bool= — the correct, updated type.
+
+Not applying means later sub-expressions work with stale, unconstricted types.
+
+:END:
+
+** What is the difference between =extend= and =apply= on the environment?
+
+:ANSWER:
+
+=extend x scheme env= adds a new variable binding ([[file:src/Env.hs::34][Env.hs:34]]):
+
+- Makes =x= available in subsequent lookups.
+- Used when we encounter a =Lam= or =Let=.
+
+=apply s env= propagates a substitution through the environment ([[file:src/Env.hs::45][Env.hs:45]]):
+
+- Replaces free type variables in every scheme by their bindings in =s=.
+- Used when new constraints have been discovered and we need sub-expressions
+  to see up-to-date types.
+
+=extend= changes *what names are in scope*; =apply= changes *what types those names have*.
+
+:END:
+
+** What does =ftv= on an environment mean, and why does =generalize= need it?
+
+:ANSWER:
+
+From [[file:src/Env.hs::52][Env.hs:52]]:
+
+#+begin_src haskell
+ftv = Map.foldr (\scheme acc -> acc `Set.union` Subst.ftvScheme scheme) Set.empty
+#+end_src
+
+=ftv env= collects all type variables that appear free (unquantified) in any
+scheme in the environment.  These variables are "live" — they are still being
+determined by some enclosing inference.
+
+=generalize= ([[file:src/Infer.hs::118][Infer.hs:118]]) uses =ftv env= to decide which variables of a newly
+inferred type are safe to universally quantify.  A variable free in =env= must
+*not* be generalised, because doing so would claim it can be anything while some
+outer expression is still trying to pin it down.
+
+:END:
+
+* Chapter 8: Type schemes — the grammar of polymorphism
+
+A type scheme is a type with some variables locked behind a ∀.  This is how
+the system expresses that a definition works for any type.
+
+** What is the difference between =Scheme [] (TFun (TVar "a") (TVar "a"))= and =Scheme ["a"] (TFun (TVar "a") (TVar "a"))=?
+
+Write both in conventional notation.  What does each one mean?
+
+:ANSWER:
+
+=Scheme [] (TFun (TVar "a") (TVar "a"))= — written ='a → 'a= — is a *monomorphic* type.
+The variable =a= is *free*.  It is some specific, unknown type not yet determined.
+It is a constraint waiting to be solved.  You cannot use this at two different
+types simultaneously.
+
+=Scheme ["a"] (TFun (TVar "a") (TVar "a"))= — written =∀a. a → a= — is a *polymorphic*
+type scheme.  The variable =a= is *bound* by the ∀.  At every use site, a fresh
+copy of =a= is created, so the function can be used at =Int → Int= and then at
+=Bool → Bool= in the same expression.
+
+The ∀ is the boundary between "still unknown" and "can vary freely."
+
+:END:
+
+** What does =instantiate= do?  Why do we need fresh variables each time?
+
+:ANSWER:
+
+From [[file:src/Infer.hs::96][Infer.hs:96]]:
+
+#+begin_src haskell
+instantiate (Scheme vars t) = do
+  freshNames <- mapM (const fresh) vars
+  let s = Map.fromList (zip vars (map TVar freshNames))
+  return (Subst.applyTy s t)
+#+end_src
+
+=instantiate= replaces every quantified variable with a *fresh* type variable.
+For =∀a. a → a=, it creates a new name ="t₁"= and returns =TVar "t₁" → TVar "t₁"=.
+
+Why fresh?  Because each *use* of a polymorphic function must be independently
+unified.  If we returned the scheme's original variable ="a"=, then unifying the
+function at one call site (=f 1=) would constrain ="a"= to =Int=, making any
+subsequent call (=f true=) fail with =Int ≠ Bool=.
+
+Fresh variables are a clean slate: each call gets its own unknowns.
+
+:END:
+
+** What does =generalize= do?  Why is the environment argument needed?
+
+:ANSWER:
+
+From [[file:src/Infer.hs::118][Infer.hs:118]]:
+
+#+begin_src haskell
+generalize env t =
+  let envFtvs       = Env.ftv env
+      tyFtvs        = Subst.ftvTy t
+      generalizable = Set.toList (tyFtvs `Set.difference` envFtvs)
+  in  Scheme generalizable t
+#+end_src
+
+=generalize env t= produces a scheme by quantifying over variables free in =t= that
+are *not* free in =env=.
+
+A variable free in =env= means some enclosing expression still has an unknown of
+that type.  Generalising over it would claim "this variable can be anything"
+while outer code is still trying to determine what it is — that would be unsound.
+
+Example: in =λx. let id = λy. y in id x=, inferring with =x : 'a= in env — ="a"= is
+free in env, so it must not be generalised.  The type of =id= becomes =∀b. b → b=,
+not =∀a b. a → b=.
+
+:END:
+
+** Trace by hand: what scheme does =let id = λx. x in …= assign to =id=?
+
+Work through =generalize= step by step.
+
+:ANSWER:
+
+1. Infer =λx. x=:
+   - Fresh var ="a"= for =x=.  Env extended: ={x : Scheme [] (TVar "a")}=.
+   - Body =Var "x"=: instantiate =Scheme [] (TVar "a")= → =TVar "a"=.
+   - Return =(empty, TFun (TVar "a") (TVar "a"))=.
+
+2. Apply =s1 = empty= to outer env (no change).
+
+3. Generalise =TFun (TVar "a") (TVar "a")= over =env_outer=:
+   - Assuming top level: =ftv(env_outer)= = ={}=.
+   - =ftvTy (TFun (TVar "a") (TVar "a"))= = ={"a"}=.
+   - Generalizable: ={"a"} \ {}= = ={"a"}=.
+   - Result: =Scheme ["a"] (TFun (TVar "a") (TVar "a"))= = =∀a. a → a=. ✓
+
+:END:
+
+* Chapter 9: Algorithm W — inference case by case
+
+Now we assemble the pieces.  =infer env expr= returns a substitution and a type.
+Each expression form triggers a different part of the algorithm.
+
+** =Lit=: why does it return =Subst.empty=?
+
+#+begin_src haskell
+Lit (LInt _) -> return (Subst.empty, TCon "Int")
+#+end_src
+
+What would it mean to return a non-empty substitution here?
+
+:ANSWER:
+
+A literal has a completely fixed type: =1 : Int=, =true : Bool=.  No type variables
+are introduced, and no constraints are discovered.  There is nothing to substitute.
+
+A non-empty substitution would claim that encountering this literal constrains
+some type variable elsewhere.  But literals are self-contained — they reveal
+nothing about variables in the surrounding environment.
+
+From [[file:src/Infer.hs::151][Infer.hs:151]].
+
+:END:
+
+** =Var=: why do we =instantiate= rather than returning the scheme's type directly?
+
+#+begin_src haskell
+Var x ->
+  case Env.lookupVar x env of
+    Nothing     -> throwError (UnboundVariable x)
+    Just scheme -> do
+      t <- instantiate scheme
+      return (Subst.empty, t)
+#+end_src
+
+If we extracted and returned =t= from the scheme without calling =instantiate=,
+what would break?
+
+:ANSWER:
+
+Consider =let id = λx. x in id 1=.  After the let-binding, env has:
+={id : Scheme ["a"] (TFun (TVar "a") (TVar "a"))}=.
+
+When we look up =id= to infer =App (Var "id") (Lit 1)=, instantiation produces a
+fresh =b=, giving us =TFun (TVar "b") (TVar "b")=.  Unifying with =Int → β= gives
+={b ↦ Int, β ↦ Int}=.
+
+If instead we returned the raw =TVar "a"= from the scheme body, and then used =id=
+again (say =id true=), both uses would share the *same* =TVar "a"=.  Unifying ="a"= with
+=Int= at the first use would constrain ="a"= for the second use, making =id true= fail
+with =Int ≠ Bool=.  We would lose polymorphism entirely.
+
+Instantiation is the mechanism that makes each use site independent.
+
+From [[file:src/Infer.hs::157][Infer.hs:157]].
+
+:END:
+
+** =Lam=: why is the argument given a monomorphic scheme =Scheme [] argTy=?
+
+#+begin_src haskell
+Lam x body -> do
+  argVar <- fresh
+  let argTy = TVar argVar
+      env'  = Env.extend x (Scheme [] argTy) env
+  (s, bodyTy) <- infer env' body
+  return (s, TFun (Subst.applyTy s argTy) bodyTy)
+#+end_src
+
+What would happen if we wrote =Scheme [argVar] argTy= instead?
+
+:ANSWER:
+
+=Scheme [argVar] argTy= = =∀t. t=.  Instantiating this at every use of =x= would
+give a different fresh variable each time.  So =x + x= could treat =x= as =Int= on
+the left and =Bool= on the right — clearly wrong.
+
+Lambda-bound arguments are monomorphic because the *caller* fixes the type at the
+call site.  The caller provides one concrete value for =x=; the body must type-check
+under the assumption that =x= has one fixed (but as-yet-unknown) type.
+
+Allowing polymorphic lambda arguments requires *System F* — a strictly more
+powerful (and undecidable) type system.  Hindley-Milner's key restriction is
+that only *let*-bound names can be polymorphic; this is precisely what keeps
+inference decidable.
+
+From [[file:src/Infer.hs::168][Infer.hs:168]].
+
+:END:
+
+** =App=: what does each of the three substitutions represent?
+
+The =App= case builds =s3 ∘ s2 ∘ s1=.  What does each substitution capture?
+Why is each one necessary?
+
+:ANSWER:
+
+From [[file:src/Infer.hs::188][Infer.hs:188]]:
+
+#+begin_src haskell
+App func arg -> do
+  (s1, funcTy) <- infer env func
+  (s2, argTy)  <- infer (Env.apply s1 env) arg
+  resVar       <- fresh
+  let resTy = TVar resVar
+  s3 <- liftUnify $ Unify.unify (Subst.applyTy s2 funcTy) (TFun argTy resTy)
+  let s = Subst.compose s3 (Subst.compose s2 s1)
+  return (s, Subst.applyTy s3 resTy)
+#+end_src
+
+- =s1=: constraints from inferring the *function* expression.  May bind variables
+  that appear in the environment or in =funcTy=.
+- =s2=: constraints from inferring the *argument* (in the =s1=-updated env).  May
+  bind further variables that appear in =funcTy=.
+- =s3=: constraints from *unifying* =s2(funcTy)= with the expected arrow type
+  =argTy → resTy=.  This reveals what the result type actually is.
+
+The composition =s3 ∘ s2 ∘ s1= replays all three layers of constraints as one.
+
+Key detail: we apply =s2= to =funcTy= before unifying (=Subst.applyTy s2 funcTy=).
+Inferring the argument may have constrained variables that appear in the
+function's type.  Skipping this leaves =funcTy= stale and can cause spurious
+unification failures or missed constraints.
+
+:END:
+
+** =Let=: when exactly does generalisation happen, and why there?
+
+The =Let= case generalises after inferring =e1= but before inferring =e2=.
+Why not earlier?  Why not later?
+
+:ANSWER:
+
+From [[file:src/Infer.hs::206][Infer.hs:206]]:
+
+#+begin_src haskell
+Let x e1 e2 -> do
+  (s1, t1) <- infer env e1
+  let env'   = Env.apply s1 env
+      scheme = generalize env' t1
+      env''  = Env.extend x scheme env'
+  (s2, t2) <- infer env'' e2
+  return (Subst.compose s2 s1, t2)
+#+end_src
+
+*Why not generalise during =e1='s inference?*
+We do not know =e1='s type until we have finished inferring it.
+Generalisation requires the complete inferred type and the current substitution.
+
+*Why not generalise after =e2=?*
+=x='s scheme must be in the environment *while* inferring =e2= — that is the whole
+purpose of =let=.  Deferring would mean =e2= sees only a monomorphic type for =x=,
+defeating let-polymorphism.
+
+*Why apply =s1= to env before generalising?*
+=s1= may have already determined some type variables.  If we generalise before
+applying =s1=, we might quantify over variables =s1= has already pinned down —
+producing an incorrectly polymorphic type.
+
+:END:
+
+* Chapter 10: The payoff — let-polymorphism
+
+All the pieces are in place.  Let us trace two complete examples and see
+polymorphism — and its limits — in action.
+
+** Trace =let id = λx. x in id 1= fully through =infer=.
+
+Work through every step, showing the substitution at each point.  Use short
+names for fresh variables: ="a"=, ="b"=, ="c"= in order of generation.
+
+:ANSWER:
+
+Expression: =Let "id" (Lam "x" (Var "x")) (App (Var "id") (Lit (LInt 1)))=
+
+Starting env: ={}=.  Counter: 0.
+
+*Step 1 — Infer =Lam "x" (Var "x")=:*
+
+- =Lam= case: fresh ="a"= (counter → 1).
+- env₁ = ={x : Scheme [] (TVar "a")}=.
+- Infer =Var "x"= in env₁: look up =x=, get =Scheme [] (TVar "a")=,
+  instantiate (no vars) → =TVar "a"=.  Return =(empty, TVar "a")=.
+- Build function type: =TFun (applyTy empty (TVar "a")) (TVar "a")= = =TFun (TVar "a") (TVar "a")=.
+- =s1 = empty=,  =t1 = TFun (TVar "a") (TVar "a")=.
+
+*Step 2 — Apply =s1=, generalise:*
+
+- =env' = applyEnv empty {}= = ={}=.
+- =generalize {} (TFun (TVar "a") (TVar "a"))=:
+  - =ftv(env')= = ={}=, =ftvTy(t1)= = ={"a"}=, generalizable = ={"a"}=.
+  - =scheme = Scheme ["a"] (TFun (TVar "a") (TVar "a"))= = =∀a. a → a=.
+- =env'' = {id : ∀a. a → a}=.
+
+*Step 3 — Infer =App (Var "id") (Lit (LInt 1))= in env'':*
+
+- =App= case.
+- Infer =Var "id"=: look up =id=, get =∀a. a → a=, instantiate.
+  Fresh ="b"= (counter → 2).
+  Return =(empty, TFun (TVar "b") (TVar "b"))=.
+  =s1' = empty=,  =funcTy = TFun (TVar "b") (TVar "b")=.
+- Infer =Lit (LInt 1)= in =applyEnv empty env''= = =env''=:
+  Return =(empty, TCon "Int")=.
+  =s2' = empty=,  =argTy = TCon "Int"=.
+- Fresh ="c"= for result (counter → 3).
+- Unify =applyTy empty funcTy= = =TFun (TVar "b") (TVar "b")= with =TFun (TCon "Int") (TVar "c")=:
+  - Unify ="b"= with =Int= → =s_arg = {b ↦ Int}=.
+  - Unify =applyTy s_arg (TVar "b")= = =TCon "Int"= with =applyTy s_arg (TVar "c")= = =TVar "c"=:
+    → =s_ret = {c ↦ Int}=.
+  - Compose: =s3' = {b ↦ Int, c ↦ Int}=.
+- Return =(s3', applyTy s3' (TVar "c"))= = =({b↦Int, c↦Int}, TCon "Int")=.
+
+*Step 4 — Compose outer let:*
+
+- =compose s2_let s1_let= = =compose {b↦Int, c↦Int} empty= = ={b↦Int, c↦Int}=.
+- Final type =t2 = TCon "Int"=.
+- Top-level: =applyTy s (TCon "Int")= = =TCon "Int"=.
+- =generalize {} (TCon "Int")= = =Scheme [] (TCon "Int")=.
+
+Result: =id 1 : Int=. ✓
+
+:END:
+
+** Trace =λf. let _ = f 1 in f true= and show where it fails.
+
+This expression tries to use a lambda-bound =f= at two different types.
+Trace inference and identify the exact failure point.
+
+:ANSWER:
+
+Expression: =Lam "f" (Let "_" (App (Var "f") (Lit (LInt 1))) (App (Var "f") (Lit (LBool True))))=
+
+Starting env: ={}=.  Counter: 0.
+
+*Step 1 — =Lam "f"=:*
+
+- Fresh ="a"= (counter → 1).
+- env₁ = ={f : Scheme [] (TVar "a")}=.
+
+*Step 2 — Infer =Let= body:*
+
+*Step 2a — Infer =App (Var "f") (Lit (LInt 1))=:*
+
+- Infer =Var "f"=: get =Scheme [] (TVar "a")=, instantiate (no vars) → =TVar "a"=.
+  =s1 = empty=,  =funcTy = TVar "a"=.
+- Infer =Lit 1=: =(empty, TCon "Int")=.  =s2 = empty=.
+- Fresh ="b"= (counter → 2).
+- Unify =TVar "a"= with =TFun (TCon "Int") (TVar "b")=:
+  - Occurs check: ="a"= ∉ =ftvTy(TFun Int b)= = ={"b"}=.  OK.
+  - =s3 = {a ↦ TFun (TCon "Int") (TVar "b")}= = ={a ↦ Int → b}=.
+- =s_app1 = {a ↦ Int → b}=.  Result type: =TVar "b"=.
+
+*Step 2b — Apply =s_app1=, attempt to generalise:*
+
+- =env' = applyEnv {a ↦ Int → b} {f : Scheme [] (TVar "a")}=
+  = ={f : Scheme [] (TFun (TCon "Int") (TVar "b"))}=.
+- =generalize env' (TVar "b")=:
+  - =ftv(env')= = ={"b"}= (from =f='s updated type).
+  - =ftvTy(TVar "b")= = ={"b"}=.
+  - Generalizable: ={"b"} \ {"b"}= = ={}=.
+  - =scheme = Scheme [] (TVar "b")= — *monomorphic*, no ∀.
+
+*Step 2c — Infer =App (Var "f") (Lit True)= in env'':*
+
+- Look up =f=: =Scheme [] (TFun (TCon "Int") (TVar "b"))=.  Instantiate (no vars) → =TFun Int b=.
+- Infer =Lit True=: =TCon "Bool"=.
+- Fresh ="c"=.  Unify =TFun Int b= with =TFun Bool c=:
+  - Unify left arguments: =TCon "Int"= with =TCon "Bool"= → *TypeMismatch Int Bool*. ✗
+
+*Why did it fail?*
+
+When we inferred =f 1=, the substitution ={a ↦ Int → b}= propagated into the
+environment, pinning =f='s type to =Int → b=.  Because =f= is *lambda-bound*, its
+scheme is =Scheme []=: no quantified variables, nothing to instantiate freshly.
+
+=generalize= tried to save us by quantifying over ="b"=, but ="b"= was free in the
+(updated) environment — =f : Int → b= — so it could not be generalised.
+=f= stayed monomorphic, and the second call to =f= at =Bool= conflicted.
+
+*The essential difference:*
+
+With =let id = λx. x=, =id='s type variable ="a"= was free in the type but *not* free in
+=env_outer= (which was empty at the top level), so =generalize= could quantify it.
+Each call site got a fresh copy.
+
+With =λf. …=, ="a"= (and later ="b"=) were free in =env₁= (which contained =f=), so they
+could never be generalised.  =f= was stuck as =Int → b= after the first call.
+
+:END:
+
+** What is the essential distinction between let-polymorphism and lambda-polymorphism?
+
+Summarise in two or three sentences.
+
+:ANSWER:
+
+In Hindley-Milner, only *let-bound* names are generalised.  After inferring the
+right-hand side of a =let=, =generalize= quantifies over any type variables that are
+not constrained by the enclosing environment, producing a ∀ scheme.  Each use of
+the let-bound name then gets a *fresh instantiation*, so different call sites can
+unify independently.
+
+Lambda-bound arguments receive monomorphic types (=Scheme []=), because the caller
+fixes their type at the call site.  Their type variables are "live" in the
+environment during inference of the body, so =generalize= cannot quantify over them.
+
+The restriction is not arbitrary: allowing polymorphic lambda arguments leads to
+System F, where type inference is undecidable.  HM's confinement of polymorphism
+to =let=-bindings is precisely what makes complete, decidable inference possible.
+
+:END:
