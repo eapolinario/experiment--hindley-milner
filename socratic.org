@@ -1039,3 +1039,318 @@ System F, where type inference is undecidable.  HM's confinement of polymorphism
 to =let=-bindings is precisely what makes complete, decidable inference possible.
 
 :END:
+
+* Chapter 11: The Museum of Wrong Algorithms
+
+The preceding chapters asked you to understand the correct algorithm.  This
+chapter asks harder questions: what breaks when you remove each invariant, one
+at a time?
+
+Every line in the implementation is load-bearing.  Each exhibit presents one
+surgical mutation.  Your task: predict what breaks and find the minimal
+expression that exposes the damage.
+
+The mutations are presented as one-line diffs.  Before reading an answer,
+genuinely attempt to find the counterexample yourself.
+
+** Exhibit I — Remove the occurs check
+
+Delete the guard on line 87 of =Unify.hs=:
+
+#+begin_src diff
+- bind v t | Set.member v (Subst.ftvTy t) = Left (OccursCheckFailed v t)
+#+end_src
+
+What expression now "type-checks" that should not?  What is the inferred scheme?
+Why is it unsound?
+
+:ANSWER:
+
+From [[file:src/Unify.hs::87][Unify.hs:87]]: the deleted guard is the *only* thing preventing =bind= from
+producing a substitution ={v ↦ t}= where =v= occurs inside =t=.
+
+*Counterexample:* =Lam "f" (App (Var "f") (Var "f"))=, written =λf. f f=.
+
+Trace without the guard:
+
+- Lam f: fresh ="t"=.  env = ={f : Scheme [] (TVar "t")}=.
+- App: infer =Var f= → =TVar "t"=, =s1=empty=.  Infer =Var f= → =TVar "t"=, =s2=empty=.
+- Fresh ="c"=.  Unify =TVar "t"= with =TFun (TVar "t") (TVar "c")=.
+  - Correct behaviour: ="t"= ∈ ftv(=t → c=) = ={"t","c"}=.  *OccursCheckFailed*.
+  - Without guard: =bind "t" (TFun (TVar "t") (TVar "c"))= succeeds.
+    =s3 = {t ↦ t → c}=.
+- Returned type: =applyTy s3 (TVar "c")= = =TVar "c"=.
+- Lam: =applyTy {t↦t→c} (TVar "t")= = =TFun (TVar "t") (TVar "c")= = =t → c=.
+  Return type: =(t → c) → c=.
+- Generalize ={}= over =(t → c) → c=: both =t= and =c= are free.  =Scheme ["t","c"] ((t → c) → c)= = =∀t c. (t → c) → c=.
+
+*Why unsound?*  The substitution ={t ↦ t → c}= is self-referential.  =applyTy=
+does not chase chains, so ={t ↦ t → c}= presents =t= as if it were a finite type
+=t → c=, hiding the infinite expansion =t = t → c = (t → c) → c = …=.  Any
+consumer that fully expands the type diverges.
+
+Note: =∀t c. (t → c) → c= happens to look like the type of the call-with-current-
+continuation operator, but it was not soundly derived here.  The real CPS type
+requires a different, safe reasoning path.
+
+:END:
+
+** Exhibit II — Skip =Env.apply s1 env= in the =App= case
+
+Change line 190 of =Infer.hs=:
+
+#+begin_src diff
+- (s2, argTy) <- infer (Env.apply s1 env) arg
++ (s2, argTy) <- infer env arg
+#+end_src
+
+What expression now produces an *unsound* scheme instead of a type error?
+
+:ANSWER:
+
+From [[file:src/Infer.hs::190][Infer.hs:190]]: the deleted =Env.apply= means the argument is inferred in a
+*stale* environment that has not yet been updated with constraints from the
+function inference.
+
+*Counterexample:* =Lam "f" (App (App (Var "f") (Lit (LInt 1))) (Var "f"))=,
+written =λf. (f 1) f=.
+
+Trace with the bug:
+
+- Lam f: fresh ="t"=.  env = ={f : Scheme [] (TVar "t")}=.
+- Outer App, func = =App (Var "f") (Lit 1)=:
+  - Infer =Var f= → =TVar "t"=, =Lit 1= → =Int=.
+  - Unify =TVar "t"= with =Int → c= (fresh =c=): =s1 = {t ↦ Int → c}=.
+  - func returns =(s1, TVar "c")=.  =funcTy = TVar "c"=.
+- Outer App, arg = =Var "f"=:
+  - *Correct*: look up =f= in =Env.apply s1 env= = ={f : Scheme [] (Int → c)}=.
+    =argTy = Int → c=.
+    Unify =TVar "c"= with =TFun (Int → c) d=: ="c"= ∈ ftv(=(Int → c) → d=) = ={"c","d"}=.
+    *OccursCheckFailed.* ✓
+  - *Wrong*: look up =f= in stale =env= = ={f : Scheme [] (TVar "t")}=.
+    =argTy = TVar "t"=.
+    Unify =TVar "c"= with =TFun (TVar "t") d=: ="c"= ∉ ={"t","d"}=.  OK.
+    =s3 = {c ↦ t → d}=.
+- Compose: =s = {t ↦ Int → t → d,  c ↦ t → d}= (self-referential: =t= appears
+  in its own binding).
+- Lam: =applyTy s (TVar "t")= = =TFun Int (TFun (TVar "t") (TVar "d"))= = =Int → t → d=.
+  Return type: =(Int → t → d) → d=.
+  Generalize: =∀t d. (Int → t → d) → d=.
+
+*Why this matters:* the occurs check fires in the *correct* algorithm because
+=Env.apply s1 env= gives the argument the updated type =Int → c= for =f=.  The
+self-referential variable =c= is then exposed.  Without =Env.apply=, the
+argument sees the stale =TVar "t"=, a different variable — the overlap disappears
+and the occurs check is never reached.
+
+:END:
+
+** Exhibit III — Do not apply =s2= to =funcTy= before unifying
+
+Change line 193 of =Infer.hs=:
+
+#+begin_src diff
+- s3 <- liftUnify $ Unify.unify (Subst.applyTy s2 funcTy) (TFun argTy resTy)
++ s3 <- liftUnify $ Unify.unify funcTy (TFun argTy resTy)
+#+end_src
+
+What does the wrong algorithm infer for =λh. h (h 1)=?  What should it infer?
+
+:ANSWER:
+
+From [[file:src/Infer.hs::193][Infer.hs:193]]: =applyTy s2 funcTy= updates the function's type with constraints
+discovered while inferring the *argument*.  Skipping this leaves =funcTy= stale.
+
+*Counterexample:* =Lam "h" (App (Var "h") (App (Var "h") (Lit (LInt 1))))=,
+written =λh. h (h 1)=.
+
+*Correct trace:*
+
+- Lam h: fresh ="t"=.  env = ={h : Scheme [] (TVar "t")}=.
+- Outer App, func = =Var h= → =TVar "t"=.  =s1=empty=,  =funcTy = TVar "t"=.
+- Outer App, arg = =App (Var h) (Lit 1)= in same env:
+  - Infer =Var h= → =TVar "t"=,  =Lit 1= → =Int=.
+  - Unify =TVar "t"= with =Int → c=: =s3' = {t ↦ Int → c}=.
+  - =s2 = {t ↦ Int → c}=.   =argTy = TVar "c"=.
+- Apply =s2= to =funcTy=: =applyTy {t ↦ Int → c} (TVar "t")= = =Int → c=.
+- Unify =Int → c= with =TFun (TVar "c") d=:
+  - Unify =Int= with =c=: ={c ↦ Int}=.  Unify =applyTy {c↦Int} c= = =Int= with =d=: ={d ↦ Int}=.
+  - =s3 = {c ↦ Int, d ↦ Int}=.
+- Final =s = {t ↦ Int → Int, c ↦ Int, d ↦ Int}=.
+- Lam h: =applyTy s (TVar "t")= = =Int → Int=.  Return type: =(Int → Int) → Int=. ✓
+
+*Wrong trace (no =applyTy s2=):*
+
+- Same =funcTy = TVar "t"=,  same =s2 = {t ↦ Int → c}=,  same =argTy = TVar "c"=.
+- Unify =TVar "t"= (stale!) with =TFun (TVar "c") d=: bind =t ↦ c → d=.
+  =s3_wrong = {t ↦ c → d}=.
+- Compose: =compose s3_wrong s2=.
+  =Map.map (applyTy {t↦c→d}) {t↦Int→c}= = ={t ↦ Int → c}= (=t= ∉ =Int→c=).
+  Union with ={t↦c→d}=: left side wins, ={t ↦ Int → c}= survives — =s3_wrong='s own
+  binding for =t= is overwritten by =s2=!
+- Returned type: =applyTy {t↦c→d} (TVar "d")= = =TVar "d"= (=d= not in =s3_wrong=).
+- Lam h: =applyTy s_wrong (TVar "t")= = =Int → c= (follows =t↦Int→c= from the composition).
+  Return type: =(Int → c) → d=.
+  Generalize: =∀c d. (Int → c) → d=.
+
+*Correct:* =∀c. (Int → Int → c) → c= — wait, the correct type above was =(Int → Int) → Int=
+(closed, no quantified vars).  The wrong type =∀c d. (Int → c) → d= claims the
+return type is *unconstrained*, and that =h= only needs to accept a single =Int=
+rather than two.  It would permit =h = (λx. true)= at a use site expecting =Int=.
+
+:END:
+
+** Exhibit IV — Replace =generalize= with =Scheme []= in =Let=
+
+Change line 209 of =Infer.hs=:
+
+#+begin_src diff
+- scheme = generalize env' t1
++ scheme = Scheme [] t1
+#+end_src
+
+What does the wrong algorithm infer for =let id = λx. x in (let _ = id 1 in id true)=?
+
+:ANSWER:
+
+From [[file:src/Infer.hs::209][Infer.hs:209]]: replacing =generalize= with =Scheme []= makes every let-binding
+*monomorphic*.  No type variables are ever quantified, and =instantiate= has
+nothing to refresh — every lookup returns the raw type with its original variables.
+
+*Counterexample:*
+=Let "id" (Lam "x" (Var "x")) (Let "_" (App (Var "id") (Lit (LInt 1))) (App (Var "id") (Lit (LBool True))))=
+
+*Correct behaviour:* =id= gets =Scheme ["a"] (TFun (TVar "a") (TVar "a"))= = =∀a. a → a=.
+Both uses get fresh instantiations; the whole expression infers =Bool=.
+
+*Wrong behaviour:*
+
+- Infer =λx. x=: returns =(empty, TFun (TVar "a") (TVar "a"))=.
+- Wrong: =scheme = Scheme [] (TFun (TVar "a") (TVar "a"))=.  No ∀, ="a"= is *free*.
+- Infer =id 1=: look up =id= → =Scheme [] (a→a)=.  Instantiate (no vars) → =TVar "a" → TVar "a"=.
+  Unify =a→a= with =Int→b=: ={a ↦ Int, b ↦ Int}=.  =id='s type variable ="a"= is now bound to =Int=.
+- Apply ={a↦Int}= to env: =id= now has =Scheme [] (Int→Int)= in the updated env.
+- Infer =id true=: look up =id= → =Scheme [] (Int→Int)=.  Instantiate → =Int→Int=.
+  Unify =Int→Int= with =Bool→c=: unify =Int= with =Bool= → *TypeMismatch Int Bool*.
+
+*The key difference:* with =Scheme []=, the first use of =id= *globally* constrains
+="a"= to =Int=.  There is no ∀ to provide isolation; both uses share the same variable.
+Monomorphism turns =id= into a single-type function the moment it is used.
+
+:END:
+
+** Exhibit V — Generalise the lambda argument
+
+Change line 171 of =Infer.hs=:
+
+#+begin_src diff
+- env' = Env.extend x (Scheme [] argTy) env
++ env' = Env.extend x (generalize env argTy) env
+#+end_src
+
+What does the wrong algorithm infer for =λx. let _ = x 1 in x true=?
+Why is this type unsound?
+
+:ANSWER:
+
+From [[file:src/Infer.hs::171][Infer.hs:171]]: normally, =x= enters the environment as =Scheme [] (TVar "a")= —
+monomorphic.  With the change, =generalize env (TVar "a")= is called (where =env= is
+the *outer* env with no free type variables), producing =Scheme ["a"] (TVar "a")= = =∀a. a=.
+Lambda argument =x= is now treated as fully polymorphic.
+
+*Counterexample:*
+=Lam "x" (Let "_" (App (Var "x") (Lit (LInt 1))) (App (Var "x") (Lit (LBool True))))=,
+written =λx. let _ = x 1 in x true=.
+
+*Correct behaviour:* =x= is monomorphic.  Inferring =x 1= constrains =x : Int→b=, and
+that constraint persists.  =x true= then tries to unify =Int= with =Bool= →
+*TypeMismatch Int Bool*. ✓
+
+*Wrong behaviour:* =x= has =∀a. a=.  Each use of =x= is independently instantiated:
+
+- =x 1=: instantiate =∀a.a= with fresh ="b"= → =TVar "b"=.  Unify =b= with =Int→c=: ={b↦Int→c}=.
+- Apply ={b↦Int→c}= to env: =x= still has =∀a.a= (="b"= is fresh from instantiation, not ="a"=).
+- Generalize ={x:∀a.a}= over =TVar "c"=: =ftv(env)= = ={}= (="a"= is bound in the scheme).
+  =c= is free; scheme = =∀c. c= — another polymorphic monoid.
+- =x true=: instantiate =∀a.a= with fresh ="d"= → =TVar "d"=.  Unify =d= with =Bool→e=: ={d↦Bool→e}=.  Returns =TVar "e"=.
+
+- Lam x: =applyTy s (TVar "a")= = =TVar "a"= (="a"= never constrained — it was hidden
+  inside the scheme's quantifier and instantiated away on every use).
+  Return type: =TFun (TVar "a") (TVar "e")= = =a → e=.
+  Generalize: =∀a e. a → e=.
+
+*Why unsound:* =∀a e. a → e= claims the lambda accepts *any* type and returns *any* type —
+ignoring all constraints from =x 1= and =x true=.  By hiding ="a"= behind a ∀, the
+constraint on the argument type can never be accumulated.  The caller could pass a
+=String= and receive a =Bool=, with no unification errors, despite the body using =x=
+at =Int= and =Bool= positions.
+
+This is why HM restricts generalisation to =let=: the caller of a lambda binds the
+argument type; only the *definition* of a let-bound name is complete before its
+scope begins, making generalisation safe.
+
+:END:
+
+** Exhibit VI — Swap the composition order in =App=
+
+Change line 194 of =Infer.hs=:
+
+#+begin_src diff
+- let s = Subst.compose s3 (Subst.compose s2 s1)
++ let s = Subst.compose s1 (Subst.compose s2 s3)
+#+end_src
+
+What does the wrong algorithm infer for =λf. f 1 2=?
+What should it infer?  Where does the divergence first appear?
+
+:ANSWER:
+
+From [[file:src/Infer.hs::194][Infer.hs:194]]: the correct order =s3 ∘ s2 ∘ s1= applies =s1= first (earliest
+constraints), then =s2=, then =s3= (latest).  The wrong order =s1 ∘ s2 ∘ s3= applies
+=s3= first and =s1= last, so =s1='s bindings overwrite =s3='s without being threaded
+through it.
+
+*Counterexample:* =Lam "f" (App (App (Var "f") (Lit (LInt 1))) (Lit (LInt 2)))=,
+written =λf. f 1 2=.
+
+*Inner App =f 1=:*
+
+- =funcTy = TVar "a"= (fresh, =f='s type).  =s1_inner=empty=.  =argTy = Int=.  =s2_inner=empty=.
+- Unify =TVar "a"= with =TFun Int b= (fresh =b=): =s3_inner = {a ↦ Int → b}=.
+- Both orderings agree here (=s1_inner=s2_inner=empty=).
+- Returned =s_inner = {a ↦ Int → b}=,  type = =TVar "b"=.
+
+*Outer App =[f 1] 2=:*
+
+- =funcTy_outer = TVar "b"=.  =s1_outer = {a ↦ Int → b}=.
+- =Lit 2=: =s2_outer=empty=.  =argTy = Int=.
+- Unify =TVar "b"= with =TFun Int c= (fresh =c=): =s3_outer = {b ↦ Int → c}=.
+
+*Correct composition =s3 ∘ s2 ∘ s1=:*
+
+=compose {b↦Int→c} {a↦Int→b}=:
+- Apply ={b↦Int→c}= to value =Int→b=: =TFun Int (Int→c)= = =Int→Int→c=.
+- ={a ↦ Int→Int→c}= ∪ ={b ↦ Int→c}= = ={a ↦ Int→Int→c,  b ↦ Int→c}=.
+- Lam: =applyTy s (TVar "a")= = =Int→Int→c=.  Return type: =(Int→Int→c) → c=.
+- Generalize: =∀c. (Int → Int → c) → c=. ✓
+
+*Wrong composition =s1 ∘ s2 ∘ s3=:*
+
+=compose {a↦Int→b} {b↦Int→c}=:
+- Apply ={a↦Int→b}= to value =Int→c=: =Int→c= unchanged (=a= ∉ =Int→c=).
+- ={b ↦ Int→c}= ∪ ={a ↦ Int→b}= = ={a ↦ Int→b,  b ↦ Int→c}=.
+- Lam: =applyTy s_wrong (TVar "a")= = =TFun Int (TVar "b")= = =Int→b=.
+  (=applyTy= does not chain: ="b"= still holds =Int→c= in the map but is not followed.)
+- Return type: =(Int→b) → c=.
+- Generalize: =∀b c. (Int → b) → c=.
+
+*Correct:* =∀c. (Int → Int → c) → c= — =f= must accept *two* =Int= arguments.
+*Wrong:* =∀b c. (Int → b) → c= — =f= only needs to accept *one* =Int=, and the
+return type is unconstrained.
+
+The essential failure: =s1= binds ="a" ↦ Int→b=, and =s3= binds ="b" ↦ Int→c=.
+Correct composition threads =s3= through =s1='s value, yielding =a ↦ Int→Int→c=
+(the chain is "baked in").  Wrong composition applies =s1= *after* =s3=, so =s1='s
+raw =Int→b= survives in ="a"='s binding, and the dependency on =b= is left dangling.
+
+:END:
