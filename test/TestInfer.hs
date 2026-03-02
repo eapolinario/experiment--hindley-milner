@@ -134,10 +134,89 @@ main = hspec $ do
                 )
                 "Bool"
 
-    describe "Phase 3: Expected failures" $ do
+    describe "Classic combinators" $ do
+        -- λf. λg. λx. f (g x)  :  ∀'a 'b 'c. ('a -> 'b) -> ('c -> 'a) -> 'c -> 'b
+        -- Canonical form: f's type appears first in the tree, so f : 'a -> 'b,
+        -- then g's output must match f's input: g : 'c -> 'a.
+        it "compose" $
+            shouldInfer
+                (lam "f" (lam "g" (lam "x" (app (v "f") (app (v "g") (v "x"))))))
+                "∀'a 'b 'c. ('a -> 'b) -> ('c -> 'a) -> 'c -> 'b"
+
+        -- λf. λx. f (f x)  :  ∀'a. ('a -> 'a) -> 'a -> 'a
+        -- f must have the same domain and codomain for f (f x) to typecheck.
+        it "apply-twice" $
+            shouldInfer
+                (lam "f" (lam "x" (app (v "f") (app (v "f") (v "x")))))
+                "∀'a. ('a -> 'a) -> 'a -> 'a"
+
+        -- λx. λy. y  :  ∀'a 'b. 'a -> 'b -> 'b
+        it "second projection" $
+            shouldInfer
+                (lam "x" (lam "y" (v "y")))
+                "∀'a 'b. 'a -> 'b -> 'b"
+
+        -- λf. λg. λx. f x (g x)  :  ∀'a 'b 'c. ('a -> 'b -> 'c) -> ('a -> 'b) -> 'a -> 'c
+        -- The S combinator. Exercises three simultaneous constraints in App.
+        it "S combinator" $
+            shouldInfer
+                (lam "f" (lam "g" (lam "x" (app (app (v "f") (v "x")) (app (v "g") (v "x"))))))
+                "∀'a 'b 'c. ('a -> 'b -> 'c) -> ('a -> 'b) -> 'a -> 'c"
+
+        -- λx. λy. x y  :  ∀'a 'b. ('a -> 'b) -> 'a -> 'b
+        it "apply (flip of $)" $
+            shouldInfer
+                (lam "x" (lam "y" (app (v "x") (v "y"))))
+                "∀'a 'b. ('a -> 'b) -> 'a -> 'b"
+
+        -- (λx. x) (λx. x)  :  ∀'a. 'a -> 'a
+        -- Identity applied to itself — tests instantiation at a function type.
+        it "identity applied to itself" $
+            shouldInfer
+                (app (lam "x" (v "x")) (lam "x" (v "x")))
+                "∀'a. 'a -> 'a"
+
+    describe "Let-polymorphism stress tests" $ do
+        -- let id = λx. x in id id  :  ∀'a. 'a -> 'a
+        -- id is instantiated twice: once as ('a -> 'a) -> ('a -> 'a), once as 'a -> 'a.
+        it "id applied to id" $
+            shouldInfer
+                (lett "id" (lam "x" (v "x")) (app (v "id") (v "id")))
+                "∀'a. 'a -> 'a"
+
+        -- let id = λx. x in id id 1  :  Int
+        -- id instantiated twice in one expression, then applied to Int.
+        it "id id 1" $
+            shouldInfer
+                (lett "id" (lam "x" (v "x")) (app (app (v "id") (v "id")) (int 1)))
+                "Int"
+
+        -- let k = λx. λy. x in let k' = k in k'  :  ∀'a 'b. 'a -> 'b -> 'a
+        -- Polymorphism of a two-argument function survives a second let binding.
+        it "const through two lets" $
+            shouldInfer
+                (lett "k" (lam "x" (lam "y" (v "x"))) (lett "k'" (v "k") (v "k'")))
+                "∀'a 'b. 'a -> 'b -> 'a"
+
+    describe "Shadowing" $ do
+        -- let x = 1 in let x = true in x  :  Bool
+        it "inner let shadows outer" $
+            shouldInfer
+                (lett "x" (int 1) (lett "x" (bool True) (v "x")))
+                "Bool"
+
+    describe "Expected failures" $ do
         -- λx. x x  →  occurs-check failure (x : a, x x requires a ~ a -> b)
         it "self-application (occurs check)" $
             shouldInfer (lam "x" (app (v "x") (v "x"))) "error"
+
+        -- λx. x x x  →  same root cause, one level deeper
+        it "self-application chained" $
+            shouldInfer (lam "x" (app (app (v "x") (v "x")) (v "x"))) "error"
+
+        -- Applying a non-function: 1 true  →  Int is not a function type
+        it "apply non-function" $
+            shouldInfer (app (int 1) (bool True)) "error"
 
         -- Unbound variable
         it "unbound variable" $
