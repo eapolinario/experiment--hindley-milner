@@ -198,6 +198,45 @@ main = hspec $ do
                 (lett "k" (lam "x" (lam "y" (v "x"))) (lett "k'" (v "k") (v "k'")))
                 "∀'a 'b. 'a -> 'b -> 'a"
 
+    describe "Flip and partial application" $ do
+        -- λf. λx. λy. f y x  :  ∀'a 'b 'c. ('a -> 'b -> 'c) -> 'b -> 'a -> 'c
+        -- flip: swaps the two arguments of a binary function.
+        it "flip" $
+            shouldInfer
+                (lam "f" (lam "x" (lam "y" (app (app (v "f") (v "y")) (v "x")))))
+                "∀'a 'b 'c. ('a -> 'b -> 'c) -> 'b -> 'a -> 'c"
+
+        -- let k = λx. λy. x in k 1  :  ∀'a. 'a -> Int
+        -- Partially applying a polymorphic function fixes one type variable.
+        it "partial application of const" $
+            shouldInfer
+                (lett "k" (lam "x" (lam "y" (v "x"))) (app (v "k") (int 1)))
+                "∀'a. 'a -> Int"
+
+        -- let twice = λf. λx. f (f x) in let id = λx. x in twice id 1  :  Int
+        -- Applies one let-bound combinator to another, then to a literal.
+        -- Stresses the generalize + instantiate interaction across two lets.
+        it "twice id 1" $
+            shouldInfer
+                ( lett
+                    "twice"
+                    (lam "f" (lam "x" (app (v "f") (app (v "f") (v "x")))))
+                    ( lett
+                        "id"
+                        (lam "x" (v "x"))
+                        (app (app (v "twice") (v "id")) (int 1))
+                    )
+                )
+                "Int"
+
+        -- λx. (λy. y) x  :  ∀'a. 'a -> 'a
+        -- Eta-expanded identity: wrapping identity in a redundant lambda
+        -- should not change the inferred type.
+        it "eta-expanded identity" $
+            shouldInfer
+                (lam "x" (app (lam "y" (v "y")) (v "x")))
+                "∀'a. 'a -> 'a"
+
     describe "Shadowing" $ do
         -- let x = 1 in let x = true in x  :  Bool
         it "inner let shadows outer" $
@@ -206,6 +245,12 @@ main = hspec $ do
                 "Bool"
 
     describe "Expected failures" $ do
+        -- λf. f f  →  occurs-check failure (f : a, f f requires a ~ a -> b)
+        -- Same root cause as self-application but with a conventionally
+        -- function-typed variable, making the error more natural to encounter.
+        it "f f (occurs check)" $
+            shouldInfer (lam "f" (app (v "f") (v "f"))) "error"
+
         -- λx. x x  →  occurs-check failure (x : a, x x requires a ~ a -> b)
         it "self-application (occurs check)" $
             shouldInfer (lam "x" (app (v "x") (v "x"))) "error"
