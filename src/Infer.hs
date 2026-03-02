@@ -11,8 +11,11 @@ module Infer
   ( InferError (..)
   , ppError
   , inferExpr
+  , inferExprTyped
     -- Exposed for tests / exploration
   , infer
+  , inferTyped
+  , applyTyped
   , instantiate
   , generalize
   , runInfer
@@ -226,3 +229,102 @@ inferExpr e = runInfer $ do
   (s, t) <- infer Env.empty e
   let t' = Subst.applyTy s t
   return (Pretty.canonicalize (generalize Env.empty t'))
+
+-- ---------------------------------------------------------------------------
+-- Typed AST construction
+-- ---------------------------------------------------------------------------
+
+-- | Apply a substitution to every type annotation inside a 'TypedExpr'.
+--
+-- Called at the end of 'inferExprTyped' to resolve all remaining type
+-- variables to their concrete types, producing a fully-annotated AST.
+applyTyped :: Subst -> TypedExpr -> TypedExpr
+applyTyped s (TELit  l t)        = TELit  l (Subst.applyTy s t)
+applyTyped s (TEVar  x t)        = TEVar  x (Subst.applyTy s t)
+applyTyped s (TELam  x pt body)  = TELam  x (Subst.applyTy s pt) (applyTyped s body)
+applyTyped s (TEApp  f a rt)     = TEApp    (applyTyped s f) (applyTyped s a) (Subst.applyTy s rt)
+applyTyped s (TELet  x sc e1 e2) = TELet  x (Subst.applyScheme s sc) (applyTyped s e1) (applyTyped s e2)
+
+-- | Like 'infer', but simultaneously builds the annotated 'TypedExpr'.
+--
+-- The type annotations stored in the returned 'TypedExpr' may still contain
+-- free type variables resolved by the returned substitution.  The caller
+-- should apply the substitution with 'applyTyped' to obtain concrete types.
+--
+-- This mirrors 'infer' case-for-case; the logic is identical, with the
+-- addition that each case constructs the corresponding 'TypedExpr' node.
+inferTyped :: Env.Env -> Expr -> Infer (Subst, TypedExpr)
+inferTyped env = \case
+
+  -- ── Literals ─────────────────────────────────────────────────────────────
+  Lit (LInt  n) -> return (Subst.empty, TELit (LInt  n) (TCon "Int"))
+  Lit (LBool b) -> return (Subst.empty, TELit (LBool b) (TCon "Bool"))
+
+  -- ── Variable ─────────────────────────────────────────────────────────────
+  -- Instantiation gives each use of a let-bound name its own fresh copies
+  -- of the quantified variables, recorded in the TEVar annotation.
+  Var x ->
+    case Env.lookupVar x env of
+      Nothing     -> throwError (UnboundVariable x)
+      Just scheme -> do
+        t <- instantiate scheme
+        return (Subst.empty, TEVar x t)
+
+  -- ── Lambda  (λx. e) ──────────────────────────────────────────────────────
+  -- Record the (initially unknown) parameter type in the TELam node.
+  -- After 'applyTyped' resolves it, the annotation shows the concrete type.
+  Lam x body -> do
+    argVar <- fresh
+    let argTy = TVar argVar
+        env'  = Env.extend x (Scheme [] argTy) env
+    (s, typedBody) <- inferTyped env' body
+    -- argTy may still be a free variable; applyTyped resolves it at the end.
+    return (s, TELam x argTy typedBody)
+
+  -- ── Application  (f x) ───────────────────────────────────────────────────
+  App func arg -> do
+    (s1, typedFunc) <- inferTyped env func
+    (s2, typedArg)  <- inferTyped (Env.apply s1 env) arg
+    resVar          <- fresh
+    let resTy = TVar resVar
+    s3 <- liftUnify $
+            Unify.unify (Subst.applyTy s2 (typeOf typedFunc))
+                        (TFun (typeOf typedArg) resTy)
+    let s = Subst.compose s3 (Subst.compose s2 s1)
+    -- resTy and the types inside typedFunc/typedArg are resolved by applyTyped.
+    return (s, TEApp typedFunc typedArg resTy)
+
+  -- ── Let  (let x = e1 in e2) ──────────────────────────────────────────────
+  -- The TELet node records the generalized scheme — the most informative
+  -- annotation in the whole typed AST, showing exactly which variables were
+  -- quantified and making the generalization step visible.
+  Let x e1 e2 -> do
+    (s1, typedE1) <- inferTyped env e1
+    let env'   = Env.apply s1 env
+        -- Apply s1 to get the current best type for generalization.
+        t1     = Subst.applyTy s1 (typeOf typedE1)
+        scheme = generalize env' t1
+        env''  = Env.extend x scheme env'
+    (s2, typedE2) <- inferTyped env'' e2
+    let s = Subst.compose s2 s1
+    return (s, TELet x scheme typedE1 typedE2)
+
+-- | Infer the type of a closed expression and return the fully-annotated
+-- 'TypedExpr' — every sub-expression labelled with its inferred type.
+--
+-- This is the \"typed-AST-out\" entry point of the project:
+--
+-- @
+--   inferExprTyped (Lam "x" (Var "x"))
+--     == Right (TELam "x" (TVar "a") (TEVar "x" (TVar "a")))
+--   -- typeOf result == TFun (TVar "a") (TVar "a")
+--
+--   inferExprTyped (App (Lam "x" (Var "x")) (Lit (LInt 1)))
+--     == Right (TEApp (TELam "x" (TCon "Int") (TEVar "x" (TCon "Int")))
+--                     (TELit (LInt 1) (TCon "Int"))
+--                     (TCon "Int"))
+-- @
+inferExprTyped :: Expr -> Either InferError TypedExpr
+inferExprTyped e = runInfer $ do
+  (s, te) <- inferTyped Env.empty e
+  return (applyTyped s te)

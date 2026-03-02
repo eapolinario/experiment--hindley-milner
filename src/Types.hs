@@ -78,3 +78,39 @@ data Expr
 -- It is the fundamental data structure of Algorithm W: unification produces
 -- substitutions, and inference threads them through the AST.
 type Subst = Map TVar Ty
+
+-- ---------------------------------------------------------------------------
+-- Typed (annotated) AST — the "typed-AST-out" of the project description
+-- ---------------------------------------------------------------------------
+
+-- | A typed expression mirrors 'Expr' but every node carries its inferred type.
+--
+-- This is the true output of the type inference engine: not just the top-level
+-- type, but a proof that every sub-expression is well-typed.
+--
+-- Use 'typeOf' to extract the type annotation at any node.
+--
+-- Construction: call 'Infer.inferExprTyped'.
+data TypedExpr
+  = TELit  Lit    Ty
+    -- ^ Literal with its concrete type.
+  | TEVar  String Ty
+    -- ^ Variable with its instantiated type (fresh copy of the scheme).
+  | TELam  String Ty TypedExpr
+    -- ^ @λ(x : paramTy). body@.  The overall type is @TFun paramTy (typeOf body)@.
+  | TEApp  TypedExpr TypedExpr Ty
+    -- ^ @(func arg) : resTy@.
+  | TELet  String Scheme TypedExpr TypedExpr
+    -- ^ @let x : σ = e1 in e2@.  The overall type is @typeOf e2@.
+  deriving (Show, Eq)
+
+-- | Extract the inferred type of a typed expression.
+--
+-- For 'TELam' the type is computed as @TFun paramTy (typeOf body)@ rather
+-- than stored directly, so the annotation stays in one canonical place.
+typeOf :: TypedExpr -> Ty
+typeOf (TELit  _ t)          = t
+typeOf (TEVar  _ t)          = t
+typeOf (TELam  _ paramTy body) = TFun paramTy (typeOf body)
+typeOf (TEApp  _ _ resTy)    = resTy
+typeOf (TELet  _ _ _ body)   = typeOf body
